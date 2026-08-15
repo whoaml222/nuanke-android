@@ -1,6 +1,6 @@
 # Releasing
 
-The stable update chain depends on one private release-signing key. Never commit or upload the key outside an encrypted secret store.
+The stable update chain depends on one private release-signing key. Never commit or upload the key. 暖刻 uses local-only signing so the keystore and password stay on the maintainer's computer.
 
 ## Local signing
 
@@ -13,14 +13,11 @@ $env:JAVA_HOME='path-to-jdk-17'
 
 Back up the keystore and its password securely. Losing them means future APKs cannot update existing installations; leaking them means an attacker could sign a malicious update.
 
-## GitHub Actions secrets
+## Publish a release
 
-Before creating a `v*` tag, configure:
+After the local build and signature checks succeed, publish only these generated files from the ignored `dist/` directory:
 
-- `NUANKE_KEYSTORE_BASE64`
-- `NUANKE_KEYSTORE_PASSWORD`
-- `NUANKE_KEY_ALIAS` (`nuanke-release`)
-- `NUANKE_KEY_PASSWORD`
+- `nuanke-vX.Y.Z.apk`
+- `nuanke-vX.Y.Z.apk.sha256`
 
-The workflow runs tests and lint, signs the release APK, creates an `.apk.sha256` sidecar, and publishes both through GitHub's own CLI. No signing material is written to the repository.
-
+Create an immutable public GitHub Release with the matching `vX.Y.Z` tag. Never upload `.local-signing/`, the keystore, its password, or an unencrypted backup. The repository CI runs source tests and lint only; release signing deliberately remains local.

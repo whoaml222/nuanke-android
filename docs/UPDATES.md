@@ -11,6 +11,6 @@
 
 If any integrity check fails, the file is deleted and installation is not offered. A release must never replace assets after publishing; use immutable GitHub Releases when available.
 
-## Release secrets
+## Release signing
 
-The public repository contains no signing key. Maintainers configure `NUANKE_KEYSTORE_BASE64`, `NUANKE_KEYSTORE_PASSWORD`, `NUANKE_KEY_ALIAS`, and `NUANKE_KEY_PASSWORD` as GitHub Actions secrets. A `v*` tag runs tests and lint, builds the signed APK, generates its `.sha256`, and publishes both assets together.
+The public repository and GitHub Actions contain no signing key or password. Releases are signed locally, then only the signed APK and its `.sha256` sidecar are uploaded. This keeps the signing identity off remote infrastructure while preserving the same-certificate check used by the app.
