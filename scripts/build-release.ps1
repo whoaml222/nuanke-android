@@ -28,4 +28,3 @@ finally {
     Remove-Item Env:ANDROID_KEY_PASSWORD -ErrorAction SilentlyContinue
     $plainPassword = $null
 }
-

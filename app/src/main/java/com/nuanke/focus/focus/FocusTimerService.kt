@@ -34,8 +34,25 @@ class FocusTimerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, getString(R.string.focus_notification_channel), NotificationManager.IMPORTANCE_LOW),
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannels(
+            listOf(
+                NotificationChannel(
+                    TIMER_CHANNEL_ID,
+                    getString(R.string.focus_notification_channel),
+                    NotificationManager.IMPORTANCE_LOW,
+                ),
+                NotificationChannel(
+                    EVENT_CHANNEL_ID,
+                    getString(R.string.focus_event_notification_channel),
+                    NotificationManager.IMPORTANCE_HIGH,
+                ).apply {
+                    description = "在专注阶段开始和结束时提醒"
+                    setSound(null, null)
+                    enableVibration(true)
+                    vibrationPattern = EVENT_VIBRATION_PATTERN
+                },
+            ),
         )
     }
 
@@ -75,6 +92,7 @@ class FocusTimerService : Service() {
         )
         scope.launch { store.setFocusState(state) }
         startForeground(NOTIFICATION_ID, notification(state))
+        announceFocusStarted(state)
         launchTicker()
     }
 
@@ -96,6 +114,7 @@ class FocusTimerService : Service() {
             while (state.running) {
                 val now = System.currentTimeMillis()
                 if (now >= state.phaseEndsAtEpochMillis) transitionPhase(now)
+                if (!state.running) break
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(state))
                 delay(1_000)
             }
@@ -103,23 +122,25 @@ class FocusTimerService : Service() {
     }
 
     private suspend fun transitionPhase(now: Long) {
-        state = when (state.phase) {
-            FocusPhase.FOCUS -> {
-                store.recordFocusCompleted(state.focusMinutes * 60_000L)
-                if (state.currentRound >= state.totalRounds) {
-                    state.copy(running = false, phase = FocusPhase.COMPLETED, phaseEndsAtEpochMillis = now)
-                } else {
-                    state.copy(phase = FocusPhase.BREAK, phaseEndsAtEpochMillis = now + state.breakMinutes * 60_000L)
-                }
-            }
-            FocusPhase.BREAK -> state.copy(
-                phase = FocusPhase.FOCUS,
-                currentRound = state.currentRound + 1,
-                phaseEndsAtEpochMillis = now + state.focusMinutes * 60_000L,
-            )
-            FocusPhase.COMPLETED -> state.copy(running = false)
+        val previous = state
+        val transition = FocusCycle.advance(state, now)
+        if (transition.completedFocusMillis > 0) {
+            store.recordFocusCompleted(transition.completedFocusMillis)
         }
+        state = transition.state
         store.setFocusState(state)
+        when (transition.event) {
+            FocusCycleEvent.SESSION_COMPLETED -> announce(
+                title = "专注完成",
+                message = "完成了 ${previous.totalRounds} 轮，辛苦了，记得舒展一下。",
+            )
+            FocusCycleEvent.FOCUS_ENDED_FOR_BREAK -> announce(
+                title = "本轮专注结束",
+                message = "第 ${previous.currentRound} 轮完成，休息 ${state.breakMinutes} 分钟。",
+            )
+            FocusCycleEvent.FOCUS_STARTED -> announceFocusStarted(state)
+            FocusCycleEvent.NONE -> Unit
+        }
         if (!state.running) {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -127,11 +148,44 @@ class FocusTimerService : Service() {
     }
 
     private fun stopTimer() {
+        val wasRunning = state.running
         timerJob?.cancel()
         state = state.copy(running = false, phase = FocusPhase.COMPLETED)
         scope.launch { store.setFocusState(state) }
+        if (wasRunning) {
+            announce(
+                title = "专注已结束",
+                message = "本次专注已由你手动结束。",
+            )
+        }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun announceFocusStarted(value: FocusState) {
+        announce(
+            title = "专注开始",
+            message = "第 ${value.currentRound}/${value.totalRounds} 轮 · ${value.focusMinutes} 分钟",
+        )
+    }
+
+    private fun announce(title: String, message: String) {
+        val openIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val alert = NotificationCompat.Builder(this, EVENT_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(message)
+            .setContentIntent(openIntent)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(EVENT_NOTIFICATION_ID, alert)
     }
 
     private fun notification(value: FocusState): Notification {
@@ -152,7 +206,7 @@ class FocusTimerService : Service() {
         val seconds = TimeUnit.MILLISECONDS.toSeconds(remaining) % 60
         val phaseText = if (value.phase == FocusPhase.BREAK) "休息" else "专注"
         val task = value.taskLabel.ifBlank { "此刻的一件事" }
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        return NotificationCompat.Builder(this, TIMER_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("$phaseText · ${value.currentRound}/${value.totalRounds} 轮")
             .setContentText("$task · %02d:%02d".format(minutes, seconds))
@@ -171,7 +225,10 @@ class FocusTimerService : Service() {
         const val EXTRA_BREAK_MINUTES = "break_minutes"
         const val EXTRA_ROUNDS = "rounds"
         const val EXTRA_BLOCKED_PACKAGES = "blocked_packages"
-        private const val CHANNEL_ID = "nuanke_focus_timer"
+        private const val TIMER_CHANNEL_ID = "nuanke_focus_timer"
+        private const val EVENT_CHANNEL_ID = "nuanke_focus_events_v1"
         private const val NOTIFICATION_ID = 1001
+        private const val EVENT_NOTIFICATION_ID = 1002
+        private val EVENT_VIBRATION_PATTERN = longArrayOf(0, 180, 90, 120)
     }
 }

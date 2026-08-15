@@ -25,6 +25,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -38,9 +39,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.BarChart
@@ -85,6 +89,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -189,6 +194,16 @@ class MainActivity : ComponentActivity() {
 
 private enum class MainTab { TODAY, RULES, STATS, SETTINGS }
 
+private enum class FocusValueKind(
+    val title: String,
+    val suffix: String,
+    val range: IntRange,
+) {
+    FOCUS("专注时长", "分钟", 1..180),
+    BREAK("休息时长", "分钟", 1..60),
+    ROUNDS("专注轮数", "轮", 1..12),
+}
+
 @Composable
 private fun NuankeApp(store: AppStore, activity: ComponentActivity) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -261,6 +276,7 @@ private fun TodayScreen(
     var focusMinutes by remember { mutableIntStateOf(25) }
     var breakMinutes by remember { mutableIntStateOf(5) }
     var rounds by remember { mutableIntStateOf(4) }
+    var customValueKind by remember { mutableStateOf<FocusValueKind?>(null) }
     var pendingStart by remember { mutableStateOf<Intent?>(null) }
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         pendingStart?.let { ContextCompat.startForegroundService(context, it) }
@@ -297,8 +313,13 @@ private fun TodayScreen(
                     Spacer(Modifier.size(14.dp))
                     Column {
                         Text("今日专注", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text("${today.focusMillis / 60_000} 分钟", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                     }
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        "${today.focusMillis / 60_000} 分钟",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
                 }
             }
         }
@@ -319,15 +340,54 @@ private fun TodayScreen(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    Spacer(Modifier.height(10.dp))
-                    NumberChooser("专注", focusMinutes, listOf(15, 25, 40, 50)) { focusMinutes = it }
-                    NumberChooser("休息", breakMinutes, listOf(5, 10, 15)) { breakMinutes = it }
-                    NumberChooser("轮数", rounds, listOf(1, 2, 4, 6), suffix = "轮") { rounds = it }
+                    Spacer(Modifier.height(12.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.48f),
+                        shape = RoundedCornerShape(22.dp),
+                    ) {
+                        Column {
+                            FocusSettingRow(
+                                title = "专注",
+                                description = "保持投入",
+                                selected = focusMinutes,
+                                values = listOf(15, 25, 40, 50),
+                                onSelect = { focusMinutes = it },
+                                onCustom = { customValueKind = FocusValueKind.FOCUS },
+                            )
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f))
+                            FocusSettingRow(
+                                title = "休息",
+                                description = "起身放松",
+                                selected = breakMinutes,
+                                values = listOf(5, 10, 15),
+                                onSelect = { breakMinutes = it },
+                                onCustom = { customValueKind = FocusValueKind.BREAK },
+                            )
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f))
+                            FocusSettingRow(
+                                title = "轮数",
+                                description = "循序完成",
+                                selected = rounds,
+                                values = listOf(1, 2, 4, 6),
+                                suffix = "轮",
+                                onSelect = { rounds = it },
+                                onCustom = { customValueKind = FocusValueKind.ROUNDS },
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
                     Text(
                         "专注时会拦截当前已启用的 ${rules.count { it.enabled }} 个限制应用；休息时自动放行。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    if (!accessibilityEnabled) {
+                        Text(
+                            "先开启应用守护，才可以开始专注并拦截分心应用。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Terracotta,
+                        )
+                    }
                     Spacer(Modifier.height(12.dp))
                     Button(
                         modifier = Modifier.fillMaxWidth(),
@@ -362,6 +422,27 @@ private fun TodayScreen(
             }
         }
     }
+
+    customValueKind?.let { kind ->
+        val current = when (kind) {
+            FocusValueKind.FOCUS -> focusMinutes
+            FocusValueKind.BREAK -> breakMinutes
+            FocusValueKind.ROUNDS -> rounds
+        }
+        CustomFocusValueDialog(
+            kind = kind,
+            current = current,
+            onDismiss = { customValueKind = null },
+            onConfirm = { value ->
+                when (kind) {
+                    FocusValueKind.FOCUS -> focusMinutes = value
+                    FocusValueKind.BREAK -> breakMinutes = value
+                    FocusValueKind.ROUNDS -> rounds = value
+                }
+                customValueKind = null
+            },
+        )
+    }
 }
 
 @Composable
@@ -383,29 +464,112 @@ private fun ActiveFocus(state: FocusState, onStop: () -> Unit) {
 }
 
 @Composable
-private fun NumberChooser(
+private fun FocusSettingRow(
     title: String,
+    description: String,
     selected: Int,
     values: List<Int>,
     suffix: String = "分钟",
     onSelect: (Int) -> Unit,
+    onCustom: () -> Unit,
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(9.dp),
     ) {
-        Text(title, fontWeight = FontWeight.Medium)
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            values.forEach { value ->
-                Surface(
-                    color = if (value == selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-                    shape = CircleShape,
-                    modifier = Modifier.clickable { onSelect(value) },
-                ) { Text("$value$suffix", modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp), style = MaterialTheme.typography.labelMedium) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(title, fontWeight = FontWeight.Bold)
+                Text(
+                    description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = CircleShape) {
+                Text(
+                    "$selected$suffix",
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.labelLarge,
+                )
             }
         }
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            values.forEach { value ->
+                SettingChip(
+                    label = "$value$suffix",
+                    selected = value == selected,
+                    onClick = { onSelect(value) },
+                )
+            }
+            SettingChip(
+                label = "自定义",
+                selected = selected !in values,
+                onClick = onCustom,
+            )
+        }
     }
+}
+
+@Composable
+private fun SettingChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+        shape = CircleShape,
+        modifier = Modifier.clickable(onClick = onClick),
+    ) {
+        Text(
+            label,
+            modifier = Modifier.padding(horizontal = 13.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+        )
+    }
+}
+
+@Composable
+private fun CustomFocusValueDialog(
+    kind: FocusValueKind,
+    current: Int,
+    onDismiss: () -> Unit,
+    onConfirm: (Int) -> Unit,
+) {
+    var input by remember(kind, current) { mutableStateOf(current.toString()) }
+    val value = input.toIntOrNull()
+    val valid = value != null && value in kind.range
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("自定义${kind.title}") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { input = it.filter(Char::isDigit).take(3) },
+                    label = { Text(kind.title) },
+                    suffix = { Text(kind.suffix) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    isError = input.isNotEmpty() && !valid,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "可设置 ${kind.range.first}–${kind.range.last}${kind.suffix}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (input.isNotEmpty() && !valid) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = valid, onClick = { onConfirm(checkNotNull(value)) }) { Text("确定") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 @Composable
@@ -499,9 +663,17 @@ private fun StatsScreen(padding: PaddingValues, rules: List<AppRule>, today: Day
             }
         }
         item {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                MetricCard("受限应用", "${totalUsage / 60_000} 分钟", Terracotta, Modifier.weight(1f))
-                MetricCard("成功拦下", "${today.blockedAttempts} 次", Sage, Modifier.weight(1f))
+            Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    MetricCard("受限应用", "${totalUsage / 60_000} 分钟", Terracotta, Modifier.weight(1f))
+                    MetricCard("拦下进入", "${today.blockedAttempts} 次", Sage, Modifier.weight(1f))
+                }
+                Text(
+                    "同一次打开只记录 1 次，离开后再次进入才会重新计数。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
             }
         }
         item { Text("近 7 天", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
@@ -697,6 +869,7 @@ private fun NumberInput(value: String, onValueChange: (String) -> Unit, label: S
         onValueChange = { onValueChange(it.filter(Char::isDigit).take(3)) },
         label = { Text(label) },
         singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         modifier = Modifier.fillMaxWidth(),
     )
 }
@@ -761,9 +934,16 @@ private fun MetricCard(title: String, value: String, accent: Color, modifier: Mo
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
     ) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(horizontal = 15.dp, vertical = 13.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(title, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(value, color = accent, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(
+                value,
+                color = accent,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }

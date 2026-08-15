@@ -5,25 +5,40 @@
     android:viewportHeight="108">
     <path
         android:fillColor="@android:color/transparent"
-        android:pathData="M78,29 C66,18 47,17 34,25 C20,34 16,52 22,68 C29,84 47,92 64,88 C72,86 78,82 83,75"
+        android:pathData="M49,20 C32,22 20,37 20,55 C20,71 29,84 42,89 M66,89 C79,83 87,70 88,56"
+        android:strokeColor="@color/sage"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="8" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M59,20 C75,22 86,34 88,49"
         android:strokeColor="@color/terracotta"
         android:strokeLineCap="round"
         android:strokeLineJoin="round"
-        android:strokeWidth="7" />
-    <path
-        android:fillColor="@color/sun_gold"
-        android:pathData="M40,65 A14,14 0,0 1,68 65 Z" />
+        android:strokeWidth="8" />
     <path
         android:fillColor="@android:color/transparent"
-        android:pathData="M54,43 L54,37 M43,47 L39,42 M65,47 L69,42"
-        android:strokeColor="@color/sun_gold"
+        android:pathData="M54,31 L54,35 M35,54 L39,54 M69,39 L66,42 M39,39 L42,42 M75,54 L71,54"
+        android:strokeColor="@color/sage_light"
         android:strokeLineCap="round"
-        android:strokeWidth="4" />
+        android:strokeWidth="2.5" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M54,55 L66,42"
+        android:strokeColor="@color/terracotta"
+        android:strokeLineCap="round"
+        android:strokeWidth="5" />
+    <path
+        android:fillColor="@color/terracotta"
+        android:pathData="M54,49 A6,6 0,1 1,53.9 49 Z" />
+    <path
+        android:fillColor="@color/terracotta"
+        android:pathData="M42,92 C43,83 48,78 54,78 C61,78 65,83 66,92 Z" />
     <path
         android:fillColor="@color/sage"
-        android:pathData="M53,75 C43,74 36,69 34,61 C43,61 50,66 53,75 Z" />
+        android:pathData="M53,83 C45,81 40,74 41,66 C49,68 53,74 53,83 Z" />
     <path
         android:fillColor="@color/sage_light"
-        android:pathData="M55,75 C58,66 65,61 74,61 C72,69 65,74 55,75 Z" />
+        android:pathData="M56,83 C57,74 63,68 72,66 C71,75 65,81 56,83 Z" />
 </vector>
-

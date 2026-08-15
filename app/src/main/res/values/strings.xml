@@ -3,6 +3,7 @@
     <string name="accessibility_service_name">暖刻应用守护</string>
     <string name="accessibility_service_description">只识别当前应用的包名，在达到你设置的限制时显示提醒并返回桌面；不会读取聊天、文字、图片或控件内容。</string>
     <string name="focus_notification_channel">专注计时</string>
+    <string name="focus_event_notification_channel">专注开始与结束</string>
     <string name="block_title">%1$s 暂时休息一下</string>
     <string name="block_remaining">约 %1$d 分钟后可以再打开</string>
 </resources>

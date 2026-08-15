@@ -21,6 +21,7 @@ import com.nuanke.focus.data.DayStats
 import com.nuanke.focus.data.FocusState
 import com.nuanke.focus.data.RuntimeState
 import com.nuanke.focus.domain.BlockReason
+import com.nuanke.focus.domain.ForegroundEntryTracker
 import com.nuanke.focus.domain.RuleDecision
 import com.nuanke.focus.domain.RuleEvaluator
 import com.nuanke.focus.domain.TimeMath
@@ -40,6 +41,9 @@ class FocusGuardAccessibilityService : AccessibilityService() {
         (application as? NuankeApplication)?.store ?: AppStore(applicationContext)
     }
     private val overlay by lazy { BlockOverlay(this) }
+    private val entryTracker by lazy {
+        ForegroundEntryTracker(setOf(packageName, SYSTEM_UI_PACKAGE))
+    }
 
     private var rules: Map<String, AppRule> = emptyMap()
     private var todayStats: DayStats? = null
@@ -51,7 +55,6 @@ class FocusGuardAccessibilityService : AccessibilityService() {
     private var pendingUsageMillis = 0L
     private var lastFlushElapsed = 0L
     private var ticker: Job? = null
-    private var blockedEntryPackage: String? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -66,20 +69,15 @@ class FocusGuardAccessibilityService : AccessibilityService() {
         if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         val packageName = event.packageName?.toString()?.takeIf(String::isNotBlank) ?: return
         // Privacy boundary: packageName is the only event field consumed. Never inspect source/text/nodes.
-        if (packageName == activePackage) return
+        val entry = entryTracker.observe(packageName) ?: return
 
         flushPendingUsage()
-        activePackage = packageName
+        activePackage = entry.packageName
         sessionElapsedMillis = 0L
         pendingUsageMillis = 0L
         lastTickElapsed = SystemClock.elapsedRealtime()
         lastFlushElapsed = lastTickElapsed
-        blockedEntryPackage = null
-
-        if (packageName == this.packageName || packageName == "com.android.systemui") {
-            overlay.dismiss()
-            return
-        }
+        overlay.dismiss()
         evaluateActivePackage()
     }
 
@@ -117,7 +115,6 @@ class FocusGuardAccessibilityService : AccessibilityService() {
 
     private fun evaluateActivePackage() {
         val packageName = activePackage ?: return
-        if (packageName == this.packageName || packageName == "com.android.systemui") return
         val rule = rules[packageName] ?: return
         val now = System.currentTimeMillis()
         val cooldown = runtimeState.cooldowns.firstOrNull { it.packageName == packageName }?.untilEpochMillis
@@ -136,6 +133,10 @@ class FocusGuardAccessibilityService : AccessibilityService() {
     }
 
     private fun block(rule: AppRule, decision: RuleDecision.Block) {
+        // One foreground entry gets one popup and one counter increment. This
+        // also prevents the ticker from recreating a dismissed overlay while
+        // Android is still completing the Home transition.
+        if (!entryTracker.markBlocked(rule.packageName)) return
         if (decision.reason == BlockReason.SESSION_LIMIT || decision.reason == BlockReason.DAILY_LIMIT) {
             runtimeState = RuntimeState(
                 runtimeState.cooldowns.filterNot { it.packageName == rule.packageName } +
@@ -143,10 +144,7 @@ class FocusGuardAccessibilityService : AccessibilityService() {
             )
             scope.launch { store.setCooldown(rule.packageName, decision.untilEpochMillis) }
         }
-        if (blockedEntryPackage != rule.packageName) {
-            blockedEntryPackage = rule.packageName
-            scope.launch { store.recordBlockedAttempt() }
-        }
+        scope.launch { store.recordBlockedAttempt() }
         overlay.show(
             packageName = rule.packageName,
             appLabel = rule.appLabel,
@@ -170,6 +168,10 @@ class FocusGuardAccessibilityService : AccessibilityService() {
         pendingUsageMillis = 0L
         lastFlushElapsed = SystemClock.elapsedRealtime()
         scope.launch { store.addAppUsage(packageName, elapsed) }
+    }
+
+    companion object {
+        private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
     }
 }
 

@@ -15,7 +15,10 @@
 
 The accessibility service declares `canRetrieveWindowContent=false` and does not call APIs that inspect the UI hierarchy.
 
+## Focus reminders
+
+Focus-start and focus-end reminders use Android's notification permission and a dedicated system notification channel. Vibration follows that channel and the phone's notification settings, so it can be muted or disabled by the user. No reminder content or timing data leaves the phone.
+
 ## Network behavior
 
 There is no telemetry, analytics, advertising, account sync, or scheduled version check. The only network feature is the manual GitHub Releases updater. It runs only after the user taps “检查更新” (and later “下载更新”). As with any HTTPS request, GitHub can observe standard connection metadata such as IP address, time, and user agent; 暖刻 sends no study history, app list, rules, or device identifiers.
-
