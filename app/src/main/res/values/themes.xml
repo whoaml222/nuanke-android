@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.Nuanke" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/terracotta</item>
+        <item name="android:navigationBarColor">@color/icon_background</item>
+        <item name="android:statusBarColor">@color/icon_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>
+
