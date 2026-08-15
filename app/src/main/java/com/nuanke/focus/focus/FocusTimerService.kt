@@ -11,6 +11,7 @@ import androidx.core.app.NotificationCompat
 import com.nuanke.focus.MainActivity
 import com.nuanke.focus.NuankeApplication
 import com.nuanke.focus.R
+import com.nuanke.focus.data.AppStore
 import com.nuanke.focus.data.FocusPhase
 import com.nuanke.focus.data.FocusState
 import java.util.concurrent.TimeUnit
@@ -25,7 +26,9 @@ import kotlinx.coroutines.launch
 
 class FocusTimerService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val store by lazy { (application as NuankeApplication).store }
+    private val store by lazy {
+        (application as? NuankeApplication)?.store ?: AppStore(applicationContext)
+    }
     private var timerJob: Job? = null
     private var state = FocusState()
 

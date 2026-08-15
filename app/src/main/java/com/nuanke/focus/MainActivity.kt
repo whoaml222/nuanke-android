@@ -1,13 +1,23 @@
 package com.nuanke.focus
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.graphics.Typeface
+import android.view.Gravity
+import android.widget.Button as AndroidButton
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -103,27 +113,95 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-        setContent {
-            NuankeTheme {
-                NuankeApp((application as NuankeApplication).store)
-            }
+
+        StartupCrashGuard.previousReport(this)?.let { report ->
+            showStartupRecovery(report)
+            return
         }
+
+        StartupCrashGuard.beginStartup(this)
+        runCatching {
+            enableEdgeToEdge()
+            val store = (application as? NuankeApplication)?.store ?: AppStore(applicationContext)
+            setContent {
+                NuankeTheme {
+                    NuankeApp(store, this@MainActivity)
+                }
+            }
+        }.onFailure { error ->
+            StartupCrashGuard.recordStartupFailure(this, error)
+            showStartupRecovery(StartupCrashGuard.previousReport(this).orEmpty())
+        }
+    }
+
+    private fun showStartupRecovery(report: String) {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).toInt()
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(36), dp(24), dp(36))
+            setBackgroundColor(AndroidColor.rgb(255, 248, 240))
+        }
+        content.addView(TextView(this).apply {
+            text = "暖刻遇到了一点启动问题"
+            textSize = 24f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(AndroidColor.rgb(69, 55, 46))
+        })
+        content.addView(TextView(this).apply {
+            text = "诊断只保存在这台手机里，不会自动上传。你可以复制后发给开发者，或清除记录再试一次。"
+            textSize = 16f
+            setTextColor(AndroidColor.rgb(102, 87, 75))
+            setPadding(0, dp(12), 0, dp(18))
+        })
+        content.addView(AndroidButton(this).apply {
+            text = "清除记录并重试"
+            isAllCaps = false
+            setOnClickListener {
+                StartupCrashGuard.clear(this@MainActivity)
+                recreate()
+            }
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        content.addView(AndroidButton(this).apply {
+            text = "复制诊断信息"
+            isAllCaps = false
+            setOnClickListener {
+                getSystemService(ClipboardManager::class.java)
+                    .setPrimaryClip(ClipData.newPlainText("暖刻启动诊断", report))
+                Toast.makeText(this@MainActivity, "诊断信息已复制", Toast.LENGTH_SHORT).show()
+            }
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(8)
+        })
+        content.addView(TextView(this).apply {
+            text = report.ifBlank { "没有读取到诊断详情，请清除记录后重试。" }
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setTextColor(AndroidColor.rgb(69, 55, 46))
+            setPadding(0, dp(20), 0, 0)
+            gravity = Gravity.START
+            setTextIsSelectable(true)
+        })
+        setContentView(ScrollView(this).apply { addView(content) })
     }
 }
 
 private enum class MainTab { TODAY, RULES, STATS, SETTINGS }
 
 @Composable
-private fun NuankeApp(store: AppStore) {
+private fun NuankeApp(store: AppStore, activity: ComponentActivity) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val activity = context as ComponentActivity
     val rules by store.rules.collectAsStateWithLifecycle(initialValue = emptyList())
     val today by store.todayStats.collectAsStateWithLifecycle(initialValue = DayStats(""))
     val history by store.statsArchive.collectAsStateWithLifecycle(initialValue = com.nuanke.focus.data.StatsArchive())
     val focus by store.focusState.collectAsStateWithLifecycle(initialValue = FocusState())
     var selectedTab by remember { mutableStateOf(MainTab.TODAY) }
     var accessibilityEnabled by remember { mutableStateOf(isGuardEnabled(context)) }
+
+    LaunchedEffect(Unit) {
+        StartupCrashGuard.markStartupComplete(activity)
+    }
 
     DisposableEffect(activity) {
         val observer = LifecycleEventObserver { _, event ->

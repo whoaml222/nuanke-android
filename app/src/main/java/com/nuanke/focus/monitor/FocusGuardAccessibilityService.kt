@@ -15,6 +15,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.nuanke.focus.NuankeApplication
 import com.nuanke.focus.R
+import com.nuanke.focus.data.AppStore
 import com.nuanke.focus.data.AppRule
 import com.nuanke.focus.data.DayStats
 import com.nuanke.focus.data.FocusState
@@ -35,7 +36,9 @@ import kotlinx.coroutines.launch
 
 class FocusGuardAccessibilityService : AccessibilityService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val store by lazy { (application as NuankeApplication).store }
+    private val store by lazy {
+        (application as? NuankeApplication)?.store ?: AppStore(applicationContext)
+    }
     private val overlay by lazy { BlockOverlay(this) }
 
     private var rules: Map<String, AppRule> = emptyMap()
