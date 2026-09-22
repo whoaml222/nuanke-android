@@ -8,9 +8,13 @@ import androidx.core.content.FileProvider
 import androidx.core.net.toUri
 import com.nuanke.focus.BuildConfig
 import com.nuanke.focus.domain.Versioning
+import com.nuanke.focus.domain.UpdatePolicy
 import java.io.File
 import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -41,7 +45,15 @@ sealed interface DownloadResult {
 }
 
 class ManualUpdater(private val context: Context) {
-    private val client = OkHttpClient.Builder().followRedirects(true).build()
+    private val client = OkHttpClient.Builder()
+        .followRedirects(true).followSslRedirects(false)
+        .callTimeout(3, java.util.concurrent.TimeUnit.MINUTES)
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .addNetworkInterceptor { chain ->
+            // Validate every redirect before sending its HTTP request, not only the final response.
+            requireAllowedUrl(chain.request().url.toString())
+            chain.proceed(chain.request())
+        }.build()
     private val json = Json { ignoreUnknownKeys = true }
 
     /** This is intentionally called only from the explicit Settings-screen button handler. */
@@ -51,6 +63,7 @@ class ManualUpdater(private val context: Context) {
             val body = getText(endpoint, "application/vnd.github+json")
             val root = json.parseToJsonElement(body).jsonObject
             val tag = root.string("tag_name")
+            UpdatePolicy.requireVersion(tag.removePrefix("v"))
             val assets = root["assets"]?.jsonArray ?: JsonArray(emptyList())
             val apk = assets.findAsset { it.endsWith(".apk", ignoreCase = true) }
                 ?: error("最新发布中没有 APK 文件")
@@ -68,26 +81,36 @@ class ManualUpdater(private val context: Context) {
             } else {
                 UpdateCheckResult.UpToDate
             }
-        }.getOrElse { UpdateCheckResult.Error(it.message ?: "检查更新失败") }
+        }.getOrElse {
+            if (it is CancellationException) throw it
+            UpdateCheckResult.Error(it.message ?: "检查更新失败")
+        }
     }
 
     suspend fun downloadAndVerify(release: ReleaseInfo): DownloadResult = withContext(Dispatchers.IO) {
-        val updateDir = File(context.filesDir, "updates").apply { mkdirs() }
-        val output = File(updateDir, "nuanke-${release.version}.apk")
+        var partial: File? = null
         runCatching {
+            UpdatePolicy.requireVersion(release.version)
+            val updateDir = File(context.filesDir, "updates")
+            check(updateDir.isDirectory || updateDir.mkdirs()) { "无法创建更新目录，请检查剩余空间" }
+            // No remote path components; separate downloads cannot overwrite one another.
+            val output = File.createTempFile("nuanke-", ".apk", updateDir).also { partial = it }
             val expected = HASH_PATTERN.find(getText(release.sha256Url, "text/plain"))
                 ?.value
                 ?.lowercase()
                 ?: error("SHA-256 文件格式不正确")
             download(release.apkUrl, output)
+            currentCoroutineContext().ensureActive()
             val actual = sha256(output)
             check(actual == expected) { "下载文件的 SHA-256 不匹配" }
-            check(apkCertificateDigests(output) == installedCertificateDigests()) {
+            val candidate = apkCertificateDigests(output, release.version)
+            check(candidate.isNotEmpty() && candidate == installedCertificateDigests()) {
                 "更新包签名与当前安装的暖刻不一致"
             }
             DownloadResult.Ready(output)
         }.getOrElse {
-            output.delete()
+            partial?.delete()
+            if (it is CancellationException) throw it
             DownloadResult.Error(it.message ?: "下载或校验失败")
         }
     }
@@ -116,11 +139,15 @@ class ManualUpdater(private val context: Context) {
         client.newCall(request).execute().use { response ->
             check(response.isSuccessful) { "GitHub 返回 ${response.code}" }
             requireAllowedUrl(response.request.url.toString())
-            return response.body?.string() ?: error("GitHub 返回空内容")
+            val body = response.body ?: error("GitHub 返回空内容")
+            return body.byteStream().use { input ->
+                val bytes = input.readBytesLimited(4 * 1024 * 1024)
+                bytes.toString(Charsets.UTF_8)
+            }
         }
     }
 
-    private fun download(url: String, output: File) {
+    private suspend fun download(url: String, output: File) {
         requireAllowedUrl(url)
         val request = Request.Builder()
             .url(url)
@@ -131,19 +158,33 @@ class ManualUpdater(private val context: Context) {
             check(response.isSuccessful) { "下载失败：${response.code}" }
             requireAllowedUrl(response.request.url.toString())
             val body = response.body ?: error("下载内容为空")
-            output.outputStream().use { sink -> body.byteStream().use { it.copyTo(sink) } }
+            output.outputStream().use { sink -> body.byteStream().use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                var total = 0L
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    check(total <= 128L * 1024 * 1024) { "更新包超出大小限制" }
+                    sink.write(buffer, 0, read)
+                }
+            } }
         }
     }
 
-    private fun requireAllowedUrl(raw: String) {
-        val uri = raw.toUri()
-        val host = uri.host.orEmpty().lowercase()
-        check(uri.scheme == "https") { "拒绝非 HTTPS 更新地址" }
-        check(
-            host == "github.com" ||
-                host == "api.github.com" ||
-                host.endsWith(".githubusercontent.com"),
-        ) { "拒绝非 GitHub 更新地址" }
+    private fun requireAllowedUrl(raw: String) = UpdatePolicy.requireAllowedUrl(raw)
+
+    private fun java.io.InputStream.readBytesLimited(limit: Int): ByteArray {
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val read = read(buffer)
+            if (read < 0) break
+            check(output.size() + read <= limit) { "更新信息超出大小限制" }
+            output.write(buffer, 0, read)
+        }
+        return output.toByteArray()
     }
 
     @Suppress("DEPRECATION")
@@ -157,11 +198,13 @@ class ManualUpdater(private val context: Context) {
     }
 
     @Suppress("DEPRECATION")
-    private fun apkCertificateDigests(apk: File): Set<String> {
+    private fun apkCertificateDigests(apk: File, expectedVersion: String): Set<String> {
         val info = context.packageManager.getPackageArchiveInfo(
             apk.absolutePath,
             PackageManager.GET_SIGNING_CERTIFICATES,
         ) ?: error("无法读取更新包信息")
+        check(info.packageName == context.packageName) { "更新包不是暖刻" }
+        check(info.longVersionCode > BuildConfig.VERSION_CODE && info.versionName == expectedVersion) { "更新包版本不符或不是升级版本" }
         val signingInfo = info.signingInfo ?: error("更新包没有签名")
         return signingInfo.apkContentsSigners.mapTo(mutableSetOf()) { sha256(it.toByteArray()) }
     }

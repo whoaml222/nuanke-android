@@ -1,3 +1,5 @@
+param([string[]]$GradleArguments = @())
+
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -18,7 +20,7 @@ try {
     $env:ANDROID_KEYSTORE_PASSWORD = $plainPassword
     $env:ANDROID_KEY_ALIAS = 'nuanke-release'
     $env:ANDROID_KEY_PASSWORD = $plainPassword
-    & (Join-Path $projectRoot 'gradlew.bat') testDebugUnitTest lintDebug assembleRelease
+    & (Join-Path $projectRoot 'gradlew.bat') testDebugUnitTest lintDebug assembleRelease @GradleArguments
     if ($LASTEXITCODE -ne 0) { throw "Gradle failed with exit code $LASTEXITCODE" }
 }
 finally {

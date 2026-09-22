@@ -13,6 +13,8 @@ $env:JAVA_HOME='path-to-jdk-17'
 
 Back up the keystore and its password securely. Losing them means future APKs cannot update existing installations; leaking them means an attacker could sign a malicious update.
 
+If compilation runs under a different Windows identity, it cannot decrypt the DPAPI password. Build an unsigned Release in that context, then run `scripts/sign-apk.ps1 -UnsignedApk <unsigned.apk> -OutputApk <new-signed.apk> -ApkSigner <Android-SDK-apksigner.bat>` under the original signing identity. This separates compilation from signing without transferring plaintext passwords or changing the signing key. Always complete tests/lint and verify the certificate before publishing.
+
 ## Publish a release
 
 After the local build and signature checks succeed, publish only these generated files from the ignored `dist/` directory:

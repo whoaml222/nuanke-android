@@ -17,7 +17,11 @@ data class FocusCycleTransition(
 )
 
 object FocusCycle {
-    fun advance(state: FocusState, nowEpochMillis: Long): FocusCycleTransition = when (state.phase) {
+    fun advance(state: FocusState, nowEpochMillis: Long): FocusCycleTransition {
+        if (!state.running || nowEpochMillis < state.phaseEndsAtEpochMillis) {
+            return FocusCycleTransition(state, FocusCycleEvent.NONE)
+        }
+        return when (state.phase) {
         FocusPhase.FOCUS -> {
             val completedMillis = state.focusMinutes * 60_000L
             if (state.currentRound >= state.totalRounds) {
@@ -55,5 +59,6 @@ object FocusCycle {
             state = state.copy(running = false),
             event = FocusCycleEvent.NONE,
         )
+    }
     }
 }

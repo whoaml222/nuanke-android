@@ -4,8 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.os.Process
 import androidx.core.content.edit
-import java.io.PrintWriter
-import java.io.StringWriter
+import com.nuanke.focus.diagnostics.ServiceDiagnostics
 
 /**
  * Keeps startup diagnostics on-device so a vendor-specific failure does not
@@ -27,6 +26,7 @@ internal object StartupCrashGuard {
             val previous = Thread.getDefaultUncaughtExceptionHandler()
             Thread.setDefaultUncaughtExceptionHandler { thread, error ->
                 runCatching {
+                    ServiceDiagnostics.error(application, "进程异常退出", error)
                     val prefs = application.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                     if (prefs.getBoolean(KEY_STARTING, false)) {
                         // A crash handler must persist before the process is terminated.
@@ -78,14 +78,12 @@ internal object StartupCrashGuard {
     }
 
     private fun format(error: Throwable): String {
-        val writer = StringWriter()
-        error.printStackTrace(PrintWriter(writer))
         return buildString {
             appendLine("暖刻 ${BuildConfig.VERSION_NAME} 启动诊断")
             appendLine("Android ${android.os.Build.VERSION.RELEASE} / API ${android.os.Build.VERSION.SDK_INT}")
             appendLine("设备 ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
             appendLine()
-            append(writer.toString())
+            append(ServiceDiagnostics.sanitizedStack(error))
         }.take(MAX_REPORT_CHARS)
     }
 }

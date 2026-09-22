@@ -1,10 +1,16 @@
 package com.nuanke.focus.monitor
 
 import android.accessibilityservice.AccessibilityService
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.PowerManager
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
@@ -12,167 +18,275 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import com.nuanke.focus.NuankeApplication
 import com.nuanke.focus.R
 import com.nuanke.focus.data.AppStore
 import com.nuanke.focus.data.AppRule
-import com.nuanke.focus.data.DayStats
-import com.nuanke.focus.data.FocusState
-import com.nuanke.focus.data.RuntimeState
+import com.nuanke.focus.data.StoreSnapshot
 import com.nuanke.focus.domain.BlockReason
 import com.nuanke.focus.domain.ForegroundEntryTracker
 import com.nuanke.focus.domain.RuleDecision
 import com.nuanke.focus.domain.RuleEvaluator
 import com.nuanke.focus.domain.TimeMath
+import com.nuanke.focus.domain.UsageClock
+import com.nuanke.focus.domain.DailyDurations
+import com.nuanke.focus.diagnostics.ServiceDiagnostics
+import java.time.LocalDate
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class FocusGuardAccessibilityService : AccessibilityService() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val store by lazy {
-        (application as? NuankeApplication)?.store ?: AppStore(applicationContext)
-    }
-    private val overlay by lazy { BlockOverlay(this) }
-    private val entryTracker by lazy {
-        ForegroundEntryTracker(setOf(packageName, SYSTEM_UI_PACKAGE))
-    }
-
-    private var rules: Map<String, AppRule> = emptyMap()
-    private var todayStats: DayStats? = null
-    private var focusState = FocusState()
-    private var runtimeState = RuntimeState()
+    private val store by lazy { (application as? NuankeApplication)?.store ?: AppStore(applicationContext) }
+    private var connectionScope: CoroutineScope? = null
+    private var overlay: BlockOverlay? = null
+    private val entryTracker = ForegroundEntryTracker(setOf("com.android.systemui"))
+    private val clock = UsageClock()
+    private var snapshot: StoreSnapshot? = null
     private var activePackage: String? = null
     private var sessionElapsedMillis = 0L
-    private var lastTickElapsed = 0L
     private var pendingUsageMillis = 0L
-    private var lastFlushElapsed = 0L
-    private var ticker: Job? = null
+    private var usageDate = ""
+    private val dailyUsage = mutableMapOf<String, Long>()
+    private val localCooldowns = mutableMapOf<String, Long>()
+    private var retryOverlayAfter = 0L
+    private var receiverRegistered = false
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_SCREEN_OFF) guarded("锁屏暂停") { leaveForeground() }
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        scope.launch { store.rules.collectLatest { rules = it.associateBy(AppRule::packageName) } }
-        scope.launch { store.todayStats.collectLatest { todayStats = it } }
-        scope.launch { store.focusState.collectLatest { focusState = it } }
-        scope.launch { store.runtimeState.collectLatest { runtimeState = it } }
-        ticker = scope.launch { runTicker() }
-    }
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        val packageName = event.packageName?.toString()?.takeIf(String::isNotBlank) ?: return
-        // Privacy boundary: packageName is the only event field consumed. Never inspect source/text/nodes.
-        val entry = entryTracker.observe(packageName) ?: return
-
-        flushPendingUsage()
-        activePackage = entry.packageName
-        sessionElapsedMillis = 0L
-        pendingUsageMillis = 0L
-        lastTickElapsed = SystemClock.elapsedRealtime()
-        lastFlushElapsed = lastTickElapsed
-        overlay.dismiss()
-        evaluateActivePackage()
-    }
-
-    override fun onInterrupt() = Unit
-
-    override fun onDestroy() {
-        flushPendingUsage()
-        overlay.dismiss()
-        ticker?.cancel()
-        scope.cancel()
-        super.onDestroy()
-    }
-
-    private suspend fun runTicker() {
-        lastTickElapsed = SystemClock.elapsedRealtime()
-        lastFlushElapsed = lastTickElapsed
-        while (true) {
-            delay(1_000)
-            val nowElapsed = SystemClock.elapsedRealtime()
-            val delta = (nowElapsed - lastTickElapsed).coerceIn(0, 5_000)
-            lastTickElapsed = nowElapsed
-            val packageName = activePackage
-            val rule = packageName?.let(rules::get)
-            val currentlyBlocked = overlay.isShowingFor(packageName)
-            if (packageName != null && rule != null && !currentlyBlocked) {
-                sessionElapsedMillis += delta
-                pendingUsageMillis += delta
-                if (nowElapsed - lastFlushElapsed >= 5_000) flushPendingUsage()
-                evaluateActivePackage()
-            } else if (packageName != null && focusState.blocks(packageName, System.currentTimeMillis())) {
-                evaluateActivePackage()
+        guarded("连接守护") {
+            connectionScope?.cancel()
+            leaveForeground()
+            snapshot = null
+            ServiceDiagnostics.connected(this)
+            if (!receiverRegistered) {
+                try {
+                    val filter = IntentFilter(Intent.ACTION_SCREEN_OFF)
+                    if (android.os.Build.VERSION.SDK_INT >= 33) {
+                        registerReceiver(screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                    } else {
+                        // SCREEN_OFF is a protected system broadcast; no app-defined permission is needed.
+                        @Suppress("DEPRECATION")
+                        registerReceiver(screenReceiver, filter)
+                    }
+                    receiverRegistered = true
+                } catch (error: RuntimeException) {
+                    // Screen-state polling below remains available if a vendor rejects registration.
+                    ServiceDiagnostics.error(this, "注册锁屏监听", error)
+                }
+            }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+            connectionScope = scope
+            scope.launch {
+                while (isActive) {
+                    try {
+                        store.snapshots.collect {
+                            snapshot = it
+                            refreshDate()
+                            val stored = it.archive.days.firstOrNull { day -> day.date == usageDate }
+                            stored?.appUsageMillis?.forEach { (pkg, millis) ->
+                                dailyUsage[pkg] = maxOf(dailyUsage[pkg] ?: 0, millis)
+                            }
+                            ServiceDiagnostics.ready()
+                            guarded("更新守护规则") { evaluateActivePackage() }
+                        }
+                    } catch (error: Exception) {
+                        if (error is CancellationException) throw error
+                        snapshot = null
+                        ServiceDiagnostics.error(this@FocusGuardAccessibilityService, "加载守护规则", error)
+                        delay(3_000)
+                    }
+                }
+            }
+            scope.launch {
+                clock.reset(SystemClock.elapsedRealtime())
+                while (isActive) {
+                    delay(1_000)
+                    guarded("守护计时") {
+                        if (!interactive()) {
+                            leaveForeground()
+                        } else {
+                            if (ServiceDiagnostics.activityVisible && activePackage != packageName) changePackage(packageName)
+                            accrueUsage()
+                            if (pendingUsageMillis >= 5_000) flushPendingUsage()
+                            evaluateActivePackage()
+                        }
+                    }
+                }
             }
         }
     }
 
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        guarded("处理前台切换") {
+            // Never access event.source, text, nodes, or window contents.
+            val foreground = event.packageName?.toString()?.takeIf(String::isNotBlank) ?: return@guarded
+            if (!interactive()) { leaveForeground(); return@guarded }
+            // Only our visible activity is a real app transition. Our overlay is not.
+            if (foreground == packageName && !ServiceDiagnostics.activityVisible) return@guarded
+            val ime = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.DEFAULT_INPUT_METHOD)
+                ?.substringBefore('/')
+            if (foreground == ime) return@guarded
+            changePackage(foreground)
+        }
+    }
+
+    private fun changePackage(foreground: String) {
+        accrueUsage()
+        val entry = entryTracker.observe(foreground) ?: return
+        flushPendingUsage()
+        activePackage = entry.packageName
+        sessionElapsedMillis = 0
+        retryOverlayAfter = 0
+        clock.reset(SystemClock.elapsedRealtime())
+        overlay?.dismiss()
+        evaluateActivePackage()
+    }
+
+    private fun interactive(): Boolean =
+        getSystemService(PowerManager::class.java).isInteractive &&
+            !getSystemService(KeyguardManager::class.java).isKeyguardLocked
+
+    private fun refreshDate() {
+        val date = LocalDate.now().toString()
+        if (usageDate == date) return
+        usageDate = date
+        dailyUsage.clear()
+        snapshot?.archive?.days?.firstOrNull { it.date == date }?.appUsageMillis?.let(dailyUsage::putAll)
+    }
+
+    private fun accrueUsage() {
+        val delta = clock.tick(SystemClock.elapsedRealtime(), interactive())
+        refreshDate()
+        val pkg = activePackage ?: return
+        val rule = snapshot?.rules?.firstOrNull { it.packageName == pkg } ?: return
+        if (!rule.enabled || entryTracker.isBlocked(pkg) || delta == 0L) return
+        sessionElapsedMillis += delta
+        pendingUsageMillis += delta
+        val todayPart = DailyDurations.split(System.currentTimeMillis(), delta)[usageDate] ?: 0
+        dailyUsage[pkg] = (dailyUsage[pkg] ?: 0) + todayPart
+    }
+
     private fun evaluateActivePackage() {
-        val packageName = activePackage ?: return
-        val rule = rules[packageName] ?: return
+        val data = snapshot ?: return
+        val pkg = activePackage ?: return
+        if (!interactive()) return
+        val rule = data.rules.firstOrNull { it.packageName == pkg }
+        if (rule == null || !rule.enabled || pkg in safetyPackages(this)) {
+            overlay?.dismiss()
+            entryTracker.releaseBlock()
+            sessionElapsedMillis = 0
+            return
+        }
+        refreshDate()
         val now = System.currentTimeMillis()
-        val cooldown = runtimeState.cooldowns.firstOrNull { it.packageName == packageName }?.untilEpochMillis
-        val daily = (todayStats?.appUsageMillis?.get(packageName) ?: 0L) + pendingUsageMillis
-        val decision = RuleEvaluator.evaluate(
-            rule = rule,
-            sessionElapsedMillis = sessionElapsedMillis,
-            dailyElapsedMillis = daily,
-            nowEpochMillis = now,
-            nextMidnightEpochMillis = TimeMath.nextMidnightEpochMillis(now),
-            cooldownUntilEpochMillis = cooldown,
-            blockedByFocus = focusState.blocks(packageName, now),
-            focusEndsAtEpochMillis = focusState.phaseEndsAtEpochMillis,
+        val cooldown = maxOf(
+            data.runtime.cooldowns.firstOrNull { it.packageName == pkg }?.untilEpochMillis ?: 0,
+            localCooldowns[pkg] ?: 0,
         )
-        if (decision is RuleDecision.Block) block(rule, decision)
+        val decision = RuleEvaluator.evaluate(
+            rule, sessionElapsedMillis, dailyUsage[pkg] ?: 0, now,
+            TimeMath.nextMidnightEpochMillis(now), cooldown,
+            data.focus.blocks(pkg, now), data.focus.phaseEndsAtEpochMillis,
+        )
+        when (decision) {
+            RuleDecision.Allow -> {
+                if (entryTracker.isBlocked(pkg)) sessionElapsedMillis = 0
+                overlay?.dismiss()
+                entryTracker.releaseBlock()
+            }
+            is RuleDecision.Block -> block(rule, decision)
+        }
     }
 
     private fun block(rule: AppRule, decision: RuleDecision.Block) {
-        // One foreground entry gets one popup and one counter increment. This
-        // also prevents the ticker from recreating a dismissed overlay while
-        // Android is still completing the Home transition.
-        if (!entryTracker.markBlocked(rule.packageName)) return
-        if (decision.reason == BlockReason.SESSION_LIMIT || decision.reason == BlockReason.DAILY_LIMIT) {
-            runtimeState = RuntimeState(
-                runtimeState.cooldowns.filterNot { it.packageName == rule.packageName } +
-                    com.nuanke.focus.data.Cooldown(rule.packageName, decision.untilEpochMillis),
-            )
-            scope.launch { store.setCooldown(rule.packageName, decision.untilEpochMillis) }
+        if (entryTracker.isBlocked(rule.packageName) || SystemClock.elapsedRealtime() < retryOverlayAfter) return
+        try {
+            val currentOverlay = overlay ?: BlockOverlay(this).also { overlay = it }
+            currentOverlay.show(
+                rule.packageName, rule.appLabel,
+                if (decision.reason == BlockReason.COOLDOWN) "刚才的约定还在生效。${rule.reminder}" else rule.reminder,
+                decision.untilEpochMillis,
+            ) {
+                guarded("返回桌面") {
+                    // Keep the reminder visible if Android rejects the Home action.
+                    if (performGlobalAction(GLOBAL_ACTION_HOME)) {
+                        currentOverlay.dismiss()
+                        activePackage = null
+                        clock.reset(SystemClock.elapsedRealtime())
+                    }
+                }
+            }
+            if (entryTracker.markBlocked(rule.packageName)) {
+                flushPendingUsage()
+                sessionElapsedMillis = 0
+                if (decision.reason == BlockReason.SESSION_LIMIT || decision.reason == BlockReason.DAILY_LIMIT) {
+                    localCooldowns[rule.packageName] = decision.untilEpochMillis
+                    store.enqueue { store.setCooldown(rule.packageName, decision.untilEpochMillis) }
+                }
+                store.enqueue { store.recordBlockedAttempt() }
+            }
+        } catch (error: Exception) {
+            // Do not count failed attachment or hammer WindowManager every tick.
+            retryOverlayAfter = SystemClock.elapsedRealtime() + 5_000
+            ServiceDiagnostics.error(this, "显示提醒", error)
         }
-        scope.launch { store.recordBlockedAttempt() }
-        overlay.show(
-            packageName = rule.packageName,
-            appLabel = rule.appLabel,
-            message = if (decision.reason == BlockReason.COOLDOWN) {
-                "刚才的约定还在生效。${rule.reminder}"
-            } else {
-                rule.reminder
-            },
-            untilEpochMillis = decision.untilEpochMillis,
-            onConfirm = {
-                performGlobalAction(GLOBAL_ACTION_HOME)
-                overlay.dismiss()
-            },
-        )
     }
 
     private fun flushPendingUsage() {
-        val packageName = activePackage ?: return
+        val pkg = activePackage ?: return
         val elapsed = pendingUsageMillis
-        if (elapsed <= 0 || rules[packageName] == null) return
-        pendingUsageMillis = 0L
-        lastFlushElapsed = SystemClock.elapsedRealtime()
-        scope.launch { store.addAppUsage(packageName, elapsed) }
+        if (elapsed <= 0) return
+        pendingUsageMillis = 0
+        val end = System.currentTimeMillis()
+        store.enqueue { store.addAppUsage(pkg, elapsed, end) }
     }
 
-    companion object {
-        private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
+    private fun leaveForeground() {
+        flushPendingUsage()
+        activePackage = null
+        sessionElapsedMillis = 0
+        entryTracker.reset()
+        clock.reset(SystemClock.elapsedRealtime())
+        overlay?.dismiss()
     }
+
+    private fun disconnect() {
+        guarded("保存守护状态") { leaveForeground() }
+        connectionScope?.cancel()
+        connectionScope = null
+        snapshot = null
+        if (receiverRegistered) {
+            runCatching { unregisterReceiver(screenReceiver) }
+            receiverRegistered = false
+        }
+        ServiceDiagnostics.disconnected(this)
+    }
+
+    private inline fun guarded(operation: String, block: () -> Unit) {
+        try { block() } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            ServiceDiagnostics.error(this, operation, error)
+        }
+    }
+
+    override fun onInterrupt() { guarded("守护中断") { leaveForeground() } }
+    override fun onUnbind(intent: Intent?): Boolean { disconnect(); return super.onUnbind(intent) }
+    override fun onDestroy() { disconnect(); super.onDestroy() }
 }
 
 private class BlockOverlay(private val service: AccessibilityService) {
@@ -200,25 +314,26 @@ private class BlockOverlay(private val service: AccessibilityService) {
             cornerRadius = dp(radius).toFloat()
         }
 
-        val root = LinearLayout(service).apply {
+        val uiContext = android.view.ContextThemeWrapper(service, R.style.Theme_Nuanke)
+        val root = LinearLayout(uiContext).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setPadding(dp(28), dp(40), dp(28), dp(40))
             setBackgroundColor(Color.argb(248, 255, 247, 238))
         }
-        val card = LinearLayout(service).apply {
+        val card = LinearLayout(uiContext).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(26), dp(28), dp(26), dp(24))
             background = rounded(Color.rgb(255, 253, 249), 28)
             elevation = dp(8).toFloat()
         }
-        val eyebrow = TextView(service).apply {
+        val eyebrow = TextView(uiContext).apply {
             text = "给自己一个温柔的停顿"
             setTextColor(Color.rgb(102, 122, 85))
             textSize = 14f
         }
-        val title = TextView(service).apply {
+        val title = TextView(uiContext).apply {
             text = service.getString(R.string.block_title, appLabel)
             setTextColor(Color.rgb(63, 52, 44))
             textSize = 24f
@@ -226,13 +341,13 @@ private class BlockOverlay(private val service: AccessibilityService) {
             gravity = Gravity.CENTER
             setPadding(0, dp(12), 0, dp(12))
         }
-        val body = TextView(service).apply {
+        val body = TextView(uiContext).apply {
             text = message
             setTextColor(Color.rgb(102, 87, 75))
             textSize = 17f
             gravity = Gravity.CENTER
         }
-        val remaining = TextView(service).apply {
+        val remaining = TextView(uiContext).apply {
             val millis = (untilEpochMillis - System.currentTimeMillis()).coerceAtLeast(0)
             val minutes = TimeUnit.MILLISECONDS.toMinutes(millis).coerceAtLeast(1)
             text = service.getString(R.string.block_remaining, minutes)
@@ -241,7 +356,7 @@ private class BlockOverlay(private val service: AccessibilityService) {
             gravity = Gravity.CENTER
             setPadding(0, dp(14), 0, dp(18))
         }
-        val button = Button(service).apply {
+        val button = Button(uiContext).apply {
             text = "知道了，去学习"
             isAllCaps = false
             textSize = 16f
@@ -264,8 +379,12 @@ private class BlockOverlay(private val service: AccessibilityService) {
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT,
         ).apply { gravity = Gravity.CENTER }
-        windowManager.addView(root, params)
-        view = root
+        val scroll = ScrollView(uiContext).apply {
+            isFillViewport = true
+            addView(root)
+        }
+        windowManager.addView(scroll, params)
+        view = scroll
     }
 
     fun dismiss() {

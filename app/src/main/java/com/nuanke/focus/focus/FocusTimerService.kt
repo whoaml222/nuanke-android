@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import com.nuanke.focus.diagnostics.ServiceDiagnostics
 import com.nuanke.focus.MainActivity
 import com.nuanke.focus.NuankeApplication
 import com.nuanke.focus.R
@@ -16,16 +17,23 @@ import com.nuanke.focus.data.FocusPhase
 import com.nuanke.focus.data.FocusState
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class FocusTimerService : Service() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + CoroutineExceptionHandler { _, error ->
+        ServiceDiagnostics.error(this, "专注计时", error)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    })
+    private val stateLock = Mutex()
     private val store by lazy {
         (application as? NuankeApplication)?.store ?: AppStore(applicationContext)
     }
@@ -34,6 +42,7 @@ class FocusTimerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        active = true
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannels(
             listOf(
@@ -57,10 +66,21 @@ class FocusTimerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> startFromIntent(intent)
-            ACTION_STOP -> stopTimer()
-            else -> restoreTimer()
+        if (intent?.action != ACTION_STOP) {
+            try { startForeground(NOTIFICATION_ID, notification(state)) } catch (error: RuntimeException) {
+                ServiceDiagnostics.error(this, "启动专注通知", error)
+                stopSelf()
+                return START_NOT_STICKY
+            }
+        }
+        scope.launch {
+            stateLock.withLock {
+                when (intent?.action) {
+                    ACTION_START -> startFromIntent(intent)
+                    ACTION_STOP -> stopTimer()
+                    else -> restoreTimer()
+                }
+            }
         }
         return START_STICKY
     }
@@ -68,12 +88,15 @@ class FocusTimerService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        active = false
         timerJob?.cancel()
         scope.cancel()
         super.onDestroy()
     }
 
-    private fun startFromIntent(intent: Intent) {
+    private suspend fun startFromIntent(intent: Intent) {
+        val stored = store.currentFocusState()
+        if (stored.running) { state = stored; launchTicker(); return }
         val focusMinutes = intent.getIntExtra(EXTRA_FOCUS_MINUTES, 25).coerceIn(1, 180)
         val breakMinutes = intent.getIntExtra(EXTRA_BREAK_MINUTES, 5).coerceIn(1, 60)
         val rounds = intent.getIntExtra(EXTRA_ROUNDS, 4).coerceIn(1, 12)
@@ -90,21 +113,18 @@ class FocusTimerService : Service() {
             totalRounds = rounds,
             blockedPackages = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES)?.toSet().orEmpty(),
         )
-        scope.launch { store.setFocusState(state) }
-        startForeground(NOTIFICATION_ID, notification(state))
+        store.setFocusState(state)
         announceFocusStarted(state)
         launchTicker()
     }
 
-    private fun restoreTimer() {
-        startForeground(NOTIFICATION_ID, notification(FocusState(running = true, phase = FocusPhase.FOCUS)))
-        scope.launch {
-            state = store.focusState.first()
-            if (!state.running) {
-                stopSelf()
-            } else {
-                launchTicker()
-            }
+    private suspend fun restoreTimer() {
+        state = store.currentFocusState()
+        if (!state.running) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        } else {
+            launchTicker()
         }
     }
 
@@ -112,8 +132,10 @@ class FocusTimerService : Service() {
         timerJob?.cancel()
         timerJob = scope.launch {
             while (state.running) {
-                val now = System.currentTimeMillis()
-                if (now >= state.phaseEndsAtEpochMillis) transitionPhase(now)
+                stateLock.withLock {
+                    val now = System.currentTimeMillis()
+                    if (state.running && now >= state.phaseEndsAtEpochMillis) transitionPhase(now)
+                }
                 if (!state.running) break
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(state))
                 delay(1_000)
@@ -124,11 +146,9 @@ class FocusTimerService : Service() {
     private suspend fun transitionPhase(now: Long) {
         val previous = state
         val transition = FocusCycle.advance(state, now)
-        if (transition.completedFocusMillis > 0) {
-            store.recordFocusCompleted(transition.completedFocusMillis)
-        }
-        state = transition.state
-        store.setFocusState(state)
+        val accepted = store.commitFocus(previous, transition.state, transition.completedFocusMillis, transition.completedFocusMillis > 0)
+        state = if (accepted) transition.state else store.currentFocusState()
+        if (!accepted) return
         when (transition.event) {
             FocusCycleEvent.SESSION_COMPLETED -> announce(
                 title = "专注完成",
@@ -147,11 +167,17 @@ class FocusTimerService : Service() {
         }
     }
 
-    private fun stopTimer() {
+    private suspend fun stopTimer() {
+        state = store.currentFocusState()
         val wasRunning = state.running
         timerJob?.cancel()
+        val previous = state
         state = state.copy(running = false, phase = FocusPhase.COMPLETED)
-        scope.launch { store.setFocusState(state) }
+        val partialMillis = if (wasRunning && previous.phase == FocusPhase.FOCUS) {
+            (previous.focusMinutes * 60_000L - (previous.phaseEndsAtEpochMillis - System.currentTimeMillis()).coerceAtLeast(0))
+                .coerceIn(0, previous.focusMinutes * 60_000L)
+        } else 0L
+        store.commitFocus(previous, state, partialMillis)
         if (wasRunning) {
             announce(
                 title = "专注已结束",
@@ -185,7 +211,8 @@ class FocusTimerService : Service() {
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
             .setAutoCancel(true)
             .build()
-        getSystemService(NotificationManager::class.java).notify(EVENT_NOTIFICATION_ID, alert)
+        runCatching { getSystemService(NotificationManager::class.java).notify(EVENT_NOTIFICATION_ID, alert) }
+            .onFailure { ServiceDiagnostics.error(this, "发送专注提醒", it) }
     }
 
     private fun notification(value: FocusState): Notification {
@@ -218,6 +245,8 @@ class FocusTimerService : Service() {
     }
 
     companion object {
+        var active = false
+            private set
         const val ACTION_START = "com.nuanke.focus.action.START_FOCUS"
         const val ACTION_STOP = "com.nuanke.focus.action.STOP_FOCUS"
         const val EXTRA_TASK = "task"

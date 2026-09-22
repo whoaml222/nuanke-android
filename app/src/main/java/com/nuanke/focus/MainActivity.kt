@@ -3,7 +3,6 @@ package com.nuanke.focus
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -76,7 +75,6 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -93,8 +91,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuanke.focus.data.AppRule
 import com.nuanke.focus.data.AppStore
@@ -102,7 +101,9 @@ import com.nuanke.focus.data.DayStats
 import com.nuanke.focus.data.FocusPhase
 import com.nuanke.focus.data.FocusState
 import com.nuanke.focus.focus.FocusTimerService
-import com.nuanke.focus.monitor.FocusGuardAccessibilityService
+import com.nuanke.focus.monitor.safetyPackages
+import com.nuanke.focus.diagnostics.ServiceDiagnostics
+import com.nuanke.focus.diagnostics.GuardHealth
 import com.nuanke.focus.ui.theme.NuankeTheme
 import com.nuanke.focus.ui.theme.Sage
 import com.nuanke.focus.ui.theme.SunGold
@@ -116,6 +117,16 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+    override fun onStart() {
+        super.onStart()
+        ServiceDiagnostics.activityVisible(true)
+    }
+
+    override fun onStop() {
+        ServiceDiagnostics.activityVisible(false)
+        super.onStop()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -213,17 +224,24 @@ private fun NuankeApp(store: AppStore, activity: ComponentActivity) {
     val focus by store.focusState.collectAsStateWithLifecycle(initialValue = FocusState())
     var selectedTab by remember { mutableStateOf(MainTab.TODAY) }
     var accessibilityEnabled by remember { mutableStateOf(isGuardEnabled(context)) }
+    val guardHealth by ServiceDiagnostics.health.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) {
         StartupCrashGuard.markStartupComplete(activity)
     }
 
-    DisposableEffect(activity) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) accessibilityEnabled = isGuardEnabled(context)
+    LaunchedEffect(activity, focus.running) {
+        activity.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            if (focus.running && !FocusTimerService.active) {
+                launchSafely(context, "恢复专注") {
+                    ContextCompat.startForegroundService(context, Intent(context, FocusTimerService::class.java))
+                }
+            }
+            while (true) {
+                accessibilityEnabled = isGuardEnabled(context)
+                delay(1_000)
+            }
         }
-        activity.lifecycle.addObserver(observer)
-        onDispose { activity.lifecycle.removeObserver(observer) }
     }
 
     Scaffold(
@@ -238,10 +256,10 @@ private fun NuankeApp(store: AppStore, activity: ComponentActivity) {
         },
     ) { padding ->
         when (selectedTab) {
-            MainTab.TODAY -> TodayScreen(padding, rules, today, focus, accessibilityEnabled)
+            MainTab.TODAY -> TodayScreen(padding, rules, today, focus, accessibilityEnabled && guardHealth.ready)
             MainTab.RULES -> RulesScreen(padding, store, rules)
             MainTab.STATS -> StatsScreen(padding, rules, today, history.days)
-            MainTab.SETTINGS -> SettingsScreen(padding, accessibilityEnabled)
+            MainTab.SETTINGS -> SettingsScreen(padding, accessibilityEnabled, guardHealth)
         }
     }
 }
@@ -279,7 +297,7 @@ private fun TodayScreen(
     var customValueKind by remember { mutableStateOf<FocusValueKind?>(null) }
     var pendingStart by remember { mutableStateOf<Intent?>(null) }
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-        pendingStart?.let { ContextCompat.startForegroundService(context, it) }
+        pendingStart?.let { launchSafely(context, "开始专注") { ContextCompat.startForegroundService(context, it) } }
         pendingStart = null
     }
 
@@ -295,8 +313,8 @@ private fun TodayScreen(
         if (!accessibilityEnabled) {
             item {
                 WarmCard(container = MaterialTheme.colorScheme.primaryContainer) {
-                    Text("应用守护还没有开启", fontWeight = FontWeight.Bold)
-                    Text("开启后才能实时计时、提醒和拦截；它不会读取屏幕内容。")
+                    Text("应用守护尚未就绪", fontWeight = FontWeight.Bold)
+                    Text("限制暂不生效。请到设置页查看真实连接状态；若系统开关自动关闭，可复制本机诊断。")
                     FilledTonalButton(onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
                         Text("去系统设置开启")
                     }
@@ -329,7 +347,9 @@ private fun TodayScreen(
                 Spacer(Modifier.height(8.dp))
                 if (focus.running) {
                     ActiveFocus(focus) {
-                        context.startService(Intent(context, FocusTimerService::class.java).setAction(FocusTimerService.ACTION_STOP))
+                        launchSafely(context, "结束专注") {
+                            context.startService(Intent(context, FocusTimerService::class.java).setAction(FocusTimerService.ACTION_STOP))
+                        }
                     }
                 } else {
                     OutlinedTextField(
@@ -377,7 +397,7 @@ private fun TodayScreen(
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "专注时会拦截当前已启用的 ${rules.count { it.enabled }} 个限制应用；休息时自动放行。",
+                        "专注时会拦截当前已启用的 ${rules.count { it.enabled }} 个限制应用；休息时解除专注拦截，原有用时上限仍生效。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -410,7 +430,7 @@ private fun TodayScreen(
                                 pendingStart = intent
                                 notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                             } else {
-                                ContextCompat.startForegroundService(context, intent)
+                                launchSafely(context, "开始专注") { ContextCompat.startForegroundService(context, intent) }
                             }
                         },
                     ) {
@@ -575,7 +595,6 @@ private fun CustomFocusValueDialog(
 @Composable
 private fun RulesScreen(padding: PaddingValues, store: AppStore, rules: List<AppRule>) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val scope = rememberCoroutineScope()
     var chooseApp by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<AppRule?>(null) }
 
@@ -610,11 +629,11 @@ private fun RulesScreen(padding: PaddingValues, store: AppStore, rules: List<App
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    Switch(checked = rule.enabled, onCheckedChange = { scope.launch { store.upsertRule(rule.copy(enabled = it)) } })
+                    Switch(checked = rule.enabled, onCheckedChange = { store.enqueue { store.upsertRule(rule.copy(enabled = it)) } })
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     IconButton(onClick = { editing = rule }) { Icon(Icons.Rounded.Edit, contentDescription = "编辑") }
-                    IconButton(onClick = { scope.launch { store.deleteRule(rule.packageName) } }) {
+                    IconButton(onClick = { store.enqueue { store.deleteRule(rule.packageName) } }) {
                         Icon(Icons.Rounded.DeleteOutline, contentDescription = "删除")
                     }
                 }
@@ -635,7 +654,7 @@ private fun RulesScreen(padding: PaddingValues, store: AppStore, rules: List<App
         RuleEditorDialog(
             initial = rule,
             onDismiss = { editing = null },
-            onSave = { scope.launch { store.upsertRule(it) }; editing = null },
+            onSave = { store.enqueue { store.upsertRule(it) }; editing = null },
         )
     }
 }
@@ -717,8 +736,9 @@ private sealed interface UpdateUiState {
 }
 
 @Composable
-private fun SettingsScreen(padding: PaddingValues, accessibilityEnabled: Boolean) {
+private fun SettingsScreen(padding: PaddingValues, accessibilityEnabled: Boolean, health: GuardHealth) {
     val context = androidx.compose.ui.platform.LocalContext.current
+    val guardReady = accessibilityEnabled && health.connected && health.ready
     val updater = remember { ManualUpdater(context.applicationContext) }
     val scope = rememberCoroutineScope()
     var updateState by remember { mutableStateOf<UpdateUiState>(UpdateUiState.Idle) }
@@ -737,17 +757,38 @@ private fun SettingsScreen(padding: PaddingValues, accessibilityEnabled: Boolean
                 Text("应用守护", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        if (accessibilityEnabled) Icons.Rounded.CheckCircle else Icons.Rounded.Security,
+                        if (guardReady) Icons.Rounded.CheckCircle else Icons.Rounded.Security,
                         contentDescription = null,
-                        tint = if (accessibilityEnabled) Sage else Terracotta,
+                        tint = if (guardReady) Sage else Terracotta,
                     )
                     Spacer(Modifier.size(8.dp))
-                    Text(if (accessibilityEnabled) "已开启，只识别前台应用包名" else "未开启，限制功能不会生效")
+                    Text(when {
+                        !accessibilityEnabled -> "系统开关未开启，限制暂不生效"
+                        !health.connected -> "系统已授权，但守护服务未连接"
+                        !health.ready -> "守护已连接，正在加载规则"
+                        else -> "守护运行中，只识别前台应用包名"
+                    })
                 }
+                health.issue?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 OutlinedButton(
                     onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text("打开辅助功能设置") }
+                Text("若开关自动关闭：先重新开启一次；若仍失败，请复制下方诊断。vivo 的自启动、后台高耗电管理也可能影响运行，请在系统应用设置中检查。无需恢复出厂设置。", style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = {
+                    launchSafely(context, "打开应用设置") {
+                        context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:${context.packageName}".toUri()))
+                    }
+                }) { Text("打开暖刻系统应用设置") }
+                OutlinedButton(onClick = {
+                    launchSafely(context, "复制本机诊断") {
+                        context.getSystemService(ClipboardManager::class.java).setPrimaryClip(
+                            ClipData.newPlainText("暖刻守护诊断", ServiceDiagnostics.report(context)),
+                        )
+                        Toast.makeText(context, "诊断已复制；不会自动上传", Toast.LENGTH_SHORT).show()
+                    }
+                }, modifier = Modifier.fillMaxWidth()) { Text("复制本机诊断") }
+                Text("仅包含暖刻版本、连接状态和自身异常位置，不包含聊天、应用清单或学习内容。", style = MaterialTheme.typography.bodySmall)
             }
         }
         item {
@@ -794,7 +835,7 @@ private fun SettingsScreen(padding: PaddingValues, accessibilityEnabled: Boolean
                     is UpdateUiState.Downloading -> Text("正在下载并校验 ${state.release.version}…", color = Sage)
                     is UpdateUiState.Ready -> {
                         Text("校验通过，可以交给 Android 安装。", color = Sage, fontWeight = FontWeight.Bold)
-                        Button(onClick = { context.startActivity(updater.installIntent(state.apk)) }, modifier = Modifier.fillMaxWidth()) {
+                        Button(onClick = { launchSafely(context, "打开安装页面") { context.startActivity(updater.installIntent(state.apk)) } }, modifier = Modifier.fillMaxWidth()) {
                             Text("打开系统安装确认")
                         }
                     }
@@ -969,21 +1010,23 @@ private fun WarmCard(
 @Suppress("DEPRECATION")
 private fun loadLaunchableApps(context: Context): List<InstalledApp> {
     val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    val safe = safetyPackages(context)
     return context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
         .asSequence()
-        .filter { it.activityInfo.packageName != context.packageName }
+        .filter { it.activityInfo.packageName !in safe }
         .map { InstalledApp(it.activityInfo.packageName, it.loadLabel(context.packageManager).toString()) }
         .distinctBy(InstalledApp::packageName)
         .sortedBy(InstalledApp::label)
         .toList()
 }
 
-private fun isGuardEnabled(context: Context): Boolean {
-    val expected = ComponentName(context, FocusGuardAccessibilityService::class.java).flattenToString()
-    return Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
-        ?.split(':')
-        ?.any { it.equals(expected, ignoreCase = true) }
-        ?: false
+private fun isGuardEnabled(context: Context): Boolean = ServiceDiagnostics.enabled(context)
+
+private inline fun launchSafely(context: Context, operation: String, block: () -> Unit) {
+    try { block() } catch (error: RuntimeException) {
+        ServiceDiagnostics.error(context, operation, error)
+        Toast.makeText(context, "$operation 失败，请查看本机诊断", Toast.LENGTH_LONG).show()
+    }
 }
 
 private fun formatDuration(millis: Long): String {

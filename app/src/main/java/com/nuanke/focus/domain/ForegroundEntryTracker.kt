@@ -27,4 +27,13 @@ class ForegroundEntryTracker(private val ignoredPackages: Set<String>) {
         blockedPackageForEntry = packageName
         return true
     }
+
+    fun isBlocked(packageName: String): Boolean = blockedPackageForEntry == packageName
+
+    fun releaseBlock() { blockedPackageForEntry = null }
+
+    fun reset() {
+        activePackage = null
+        blockedPackageForEntry = null
+    }
 }

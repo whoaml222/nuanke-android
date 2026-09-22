@@ -20,4 +20,8 @@ The service uses elapsed realtime for session durations so changing the wall clo
 
 ## Recovery
 
+The guard separates system authorization from its actual connection/loaded-rule state. Connection, event, screen-state and overlay errors are recorded in a bounded local diagnostic log. A failed overlay is not counted or marked as handled and is retried with backoff. Screen-off and own-activity transitions stop restricted-app counting. Home, system settings and the default phone are excluded from restriction.
+
+DataStore has one process-lifetime shared read stream; timer commands read authoritative persisted state. Accepted usage writes outlive service teardown. Focus state and aggregate statistics commit in one transaction with an expected-state check, preventing duplicate completion and cancelled stop writes. Local-date usage is split at midnight.
+
 Disabling 暖刻's accessibility service immediately stops interception. Uninstalling the app removes all local rules and data. The app never obtains device-admin or device-owner privileges.

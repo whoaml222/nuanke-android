@@ -8,6 +8,7 @@
 - user-configured limits, cooldowns, and reminder copy;
 - focus task labels, durations, completions, and interruption counts;
 - per-day aggregate use time and blocked-attempt counts.
+- a bounded local service diagnostic log: connection timestamps, exception types/code frames without messages, and this app's recent process-exit reason codes. It is never uploaded automatically; copying it to the clipboard is an explicit user action.
 
 ## Never collected
 
