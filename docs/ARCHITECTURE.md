@@ -7,6 +7,8 @@
 - Local stores: DataStore-backed rules, focus state, and daily aggregates. No cloud storage or usage-access permission.
 - `FocusTimerService`: a visible, user-started foreground timer; it does not schedule network work.
 - Manual updater: created and invoked only by an explicit UI action.
+- DiaryActivity: non-exported, secure-window system-authentication boundary; no unlocked state survives a stop or recreation. System photo/document result callbacks are registered in the Activity, while sensitive Compose content is mounted only after authentication.
+- DiaryRepository: independent lazy process-owned SQLite store with encrypted entry/photo blobs. A conflated signal drains per-entry immutable snapshots in transactions; failed writes retain the newest pending snapshot and expose a retry state. Photo import, backup and restore serialize with the writer. Existing guard/focus data formats are untouched.
 
 ## Rule precedence
 

@@ -17,10 +17,16 @@ data class GuardHealth(val connected: Boolean = false, val ready: Boolean = fals
 object ServiceDiagnostics {
     private val mutableHealth = MutableStateFlow(GuardHealth())
     val health = mutableHealth.asStateFlow()
-    var activityVisible = false
-        private set
+    private val visibleActivities = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
+    private var legacyVisible = false
+    val activityVisible: Boolean get() = synchronized(visibleActivities) { legacyVisible || visibleActivities.isNotEmpty() }
 
-    fun activityVisible(visible: Boolean) { activityVisible = visible }
+    fun activityVisible(visible: Boolean) { synchronized(visibleActivities) { legacyVisible = visible } }
+    fun activityVisible(owner: Any, visible: Boolean) {
+        synchronized(visibleActivities) {
+            if (visible) visibleActivities.add(owner) else visibleActivities.remove(owner)
+        }
+    }
 
     fun connected(context: Context) {
         mutableHealth.value = GuardHealth(connected = true)

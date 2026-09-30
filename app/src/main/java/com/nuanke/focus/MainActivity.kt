@@ -50,6 +50,9 @@ import androidx.compose.material.icons.rounded.BarChart
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.EditNote
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Security
@@ -74,6 +77,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -119,11 +125,11 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
-        ServiceDiagnostics.activityVisible(true)
+        ServiceDiagnostics.activityVisible(this, true)
     }
 
     override fun onStop() {
-        ServiceDiagnostics.activityVisible(false)
+        ServiceDiagnostics.activityVisible(this, false)
         super.onStop()
     }
 
@@ -203,7 +209,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class MainTab { TODAY, RULES, STATS, SETTINGS }
+private enum class MainTab { TODAY, RULES, DIARY, STATS, SETTINGS }
 
 private enum class FocusValueKind(
     val title: String,
@@ -216,6 +222,7 @@ private enum class FocusValueKind(
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 private fun NuankeApp(store: AppStore, activity: ComponentActivity) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val rules by store.rules.collectAsStateWithLifecycle(initialValue = emptyList())
@@ -223,6 +230,11 @@ private fun NuankeApp(store: AppStore, activity: ComponentActivity) {
     val history by store.statsArchive.collectAsStateWithLifecycle(initialValue = com.nuanke.focus.data.StatsArchive())
     val focus by store.focusState.collectAsStateWithLifecycle(initialValue = FocusState())
     var selectedTab by remember { mutableStateOf(MainTab.TODAY) }
+    val diaryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val destination = result.data?.getStringExtra("destination")
+        selectedTab = MainTab.entries.firstOrNull { it.name == destination && it != MainTab.DIARY } ?: MainTab.TODAY
+    }
+    val openDiary = { diaryLauncher.launch(Intent(context, com.nuanke.focus.diary.DiaryActivity::class.java)) }
     var accessibilityEnabled by remember { mutableStateOf(isGuardEnabled(context)) }
     val guardHealth by ServiceDiagnostics.health.collectAsStateWithLifecycle()
 
@@ -246,17 +258,24 @@ private fun NuankeApp(store: AppStore, activity: ComponentActivity) {
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
+        topBar = {
+            TopAppBar(title = { Text(if (selectedTab == MainTab.SETTINGS) "设置" else "暖刻") },
+                navigationIcon = { if (selectedTab == MainTab.SETTINGS) IconButton(onClick = { selectedTab = MainTab.TODAY }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "返回") } },
+                actions = { if (selectedTab != MainTab.SETTINGS) IconButton(onClick = { selectedTab = MainTab.SETTINGS }) { Icon(Icons.Rounded.Settings, "设置") } },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background))
+        },
         bottomBar = {
             NavigationBar(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.98f)) {
                 TabItem(MainTab.TODAY, selectedTab, "今天", Icons.Rounded.Home) { selectedTab = it }
                 TabItem(MainTab.RULES, selectedTab, "限制", Icons.Rounded.Security) { selectedTab = it }
+                TabItem(MainTab.DIARY, selectedTab, "随记", Icons.Rounded.EditNote) { openDiary() }
                 TabItem(MainTab.STATS, selectedTab, "回顾", Icons.Rounded.BarChart) { selectedTab = it }
-                TabItem(MainTab.SETTINGS, selectedTab, "设置", Icons.Rounded.Spa) { selectedTab = it }
             }
         },
     ) { padding ->
         when (selectedTab) {
-            MainTab.TODAY -> TodayScreen(padding, rules, today, focus, accessibilityEnabled && guardHealth.ready)
+            MainTab.TODAY -> TodayScreen(padding, rules, today, focus, accessibilityEnabled && guardHealth.ready, openDiary)
+            MainTab.DIARY -> Unit
             MainTab.RULES -> RulesScreen(padding, store, rules)
             MainTab.STATS -> StatsScreen(padding, rules, today, history.days)
             MainTab.SETTINGS -> SettingsScreen(padding, accessibilityEnabled, guardHealth)
@@ -288,6 +307,7 @@ private fun TodayScreen(
     today: DayStats,
     focus: FocusState,
     accessibilityEnabled: Boolean,
+    openDiary: () -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var task by remember { mutableStateOf("") }
@@ -309,6 +329,13 @@ private fun TodayScreen(
         item {
             Text("把这一刻，轻轻留给自己", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
             Text("暖刻陪你少刷一会儿，多完成一点点。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        item {
+            OutlinedButton(onClick = openDiary, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Rounded.EditNote, null)
+                Spacer(Modifier.size(8.dp))
+                Text("今天，有什么想留给自己？")
+            }
         }
         if (!accessibilityEnabled) {
             item {
@@ -794,7 +821,7 @@ private fun SettingsScreen(padding: PaddingValues, accessibilityEnabled: Boolean
         item {
             WarmCard {
                 Text("隐私说明", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                Text("不读取聊天、文字、图片或控件内容；不收集账号、设备标识或应用清单；所有学习和使用记录仅保存在本机。")
+                Text("应用守护不读取其他应用的聊天、文字、图片或控件内容。随记只保存你主动填写的内容和选取的照片，并在本机加密；不上传日记、账号或设备标识。学习和使用记录仅保存在本机。")
                 Text("关闭系统里的“暖刻应用守护”即可立即停止全部拦截。", color = Sage)
             }
         }

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0
+
+- Add private diary with optional titles, backdating, moods/tags, search, month/day filters and focus-stat snapshots.
+- Add up to six user-selected photos per entry, local encrypted storage, autosave with failure/retry state and 30-day trash.
+- Protect the entire diary with system biometric/device-credential authentication and secure-window screenshot/preview protection; relock on background/exit.
+- Add password-encrypted manual backup/merge restore; no account, cloud sync, analytics or automatic networking.
+- Keep four bottom destinations (Today, Limits, Diary, Review); move Settings to a top-bar action.
+
+## 0.2.1
+
+- Repair guard lifecycle recovery, overlay deduplication/retry, foreground timing, cooldown release and focus persistence.
+- Add local-only sanitized diagnostics and actual service connection state; harden manual update validation.
+
 ## 0.2.0
 
 - Add validated custom focus, break, and round values with a responsive narrow-screen layout.
